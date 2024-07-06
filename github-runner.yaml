@@ -1,0 +1,517 @@
+---
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deploys github runners fleet.
+
+Metadata:
+  'AWS::CloudFormation::Interface':
+    ParameterGroups:
+    - Label:
+        default: 'Parent Stacks'
+      Parameters:
+      - ParentVPCStack
+      - ParentAlertStack
+    - Label:
+        default: 'Github runner instance'
+      Parameters:
+      - RunnerInstanceType
+      - InstancesNumber
+      - LogsRetentionInDays
+      - RunnersNumber
+      - MasterVolumeSize
+    - Label:
+        default: 'Credentials'
+      Parameters:
+      - GithubOrganization
+      - GithubToken
+      - ProductionAccountId
+      - StagingAccountId
+
+Parameters:
+  ParentVPCStack:
+    Description: Stack name of parent VPC stack.
+    Type: String
+
+  ParentAlertStack:
+    Description: Stack name of parent alert stack.
+    Type: String
+    Default: ''
+
+  RunnerInstanceType:
+    Description: Instance type for Github runners.
+    Type: String
+    Default: 't2.medium'
+
+  LogsRetentionInDays:
+    Description: Specifies the number of days you want to retain log events.
+    Type: Number
+    Default: 14
+    AllowedValues: [1, 3, 5, 7, 14, 30, 60, 90, 120, 150, 180, 365, 400, 545, 731, 1827, 3653]
+
+  ProductionAccountId:
+    Description: ID of the production AWS account.
+    Type: String
+
+  StagingAccountId:
+    Description: ID of the staging AWS account.
+    Type: String
+
+  InstancesNumber:
+    Description: Number of instances
+    Type: Number
+    Default: 1
+
+  RunnersNumber:
+    Description: Number of github runners per instance
+    Type: Number
+    Default: 2
+
+  MasterVolumeSize:
+    Description: The root volume size, in Gibibytes (GiB)
+    Type: Number
+    Default: 100 
+    ConstraintDescription: 'Must be in the range [8-1024]'
+    MinValue: 8
+    MaxValue: 1024
+
+  GithubOrganization:
+    Description: Name of organization used in runner registration request
+    Type: String
+
+  GithubToken:
+    Description: Github token used in runner registration request
+    Type: String
+    NoEcho: true
+
+Mappings:
+  Manager:
+    'eu-north-1':
+      AmiId: 'ami-08bdc08970fcbd34a'
+    'ap-south-1':
+      AmiId: 'ami-057752b3f1d6c4d6c'
+    'eu-west-3':
+      AmiId: 'ami-021d41cbdefc0c994'
+    'eu-west-2':
+      AmiId: 'ami-0d729d2846a86a9e7'
+    'eu-west-1':
+      AmiId: 'ami-0c1bc246476a5572b'
+    'ap-northeast-3':
+      AmiId: 'ami-0ca3b0faa0c4c4bbd'
+    'ap-northeast-2':
+      AmiId: 'ami-0cbec04a61be382d9'
+    'ap-northeast-1':
+      AmiId: 'ami-02c3627b04781eada'
+    'sa-east-1':
+      AmiId: 'ami-0800f9916b7655289'
+    'ca-central-1':
+      AmiId: 'ami-0843f7c45354d48b5'
+    'ap-southeast-1':
+      AmiId: 'ami-0bd6906508e74f692'
+    'ap-southeast-2':
+      AmiId: 'ami-0c6120f461d6b39e9'
+    'eu-central-1':
+      AmiId: 'ami-09439f09c55136ecf'
+    'us-east-1':
+      AmiId: 'ami-0022f774911c1d690'
+    'us-east-2':
+      AmiId: 'ami-0fa49cc9dc8d62c84'
+    'us-west-1':
+      AmiId: 'ami-02541b8af977f6cdd'
+    'us-west-2':
+      AmiId: 'ami-0ca285d4c2cda3300'
+
+Conditions:
+  HasAlertTopic: !Not [!Equals [!Ref ParentAlertStack, '']]
+
+Resources:
+  RunnerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: GithubRunners
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryFullAccess
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: 'Allow'
+            Principal:
+              Service:
+                - 'ec2.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      Policies:
+        - PolicyName: DeployerProduction
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 'sts:AssumeRole'
+              Resource:
+              - !Sub 'arn:aws:iam::${ProductionAccountId}:role/deployer'
+        - PolicyName: DeployerStaging
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            - Effect: Allow
+              Action:
+              - 'sts:AssumeRole'
+              Resource:
+              - !Sub 'arn:aws:iam::${StagingAccountId}:role/deployer'
+
+  RunnerInstanceProfileRole:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Roles:
+        - !Ref 'RunnerRole'
+
+  LaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Metadata:
+      'AWS::CloudFormation::Init':
+        configSets:
+          system:
+            - 'system'
+          docker:
+            - 'docker-install'
+          github:
+            - 'github-install'
+            - 'github-run'
+          default:
+            - ConfigSet: 'system'
+            - ConfigSet: 'docker'
+            - ConfigSet: 'github'
+        docker-install:
+          packages:
+            yum:
+              docker: []
+          commands:
+            '10-download-docker-compose':
+              command: 'curl -L "https://github.com/docker/compose/releases/download/v2.19.0/docker-compose-$(uname -s)-$(uname -m)" -o /usr/local/bin/docker-compose'
+            '20-fix-permissions-docker-compose':
+              command: 'chmod 755 /usr/local/bin/docker-compose'
+          services:
+            systemd:
+              docker:
+                enabled: "true"
+                ensureRunning: "true"
+        github-install:
+          packages:
+            yum:
+              cronie: []
+          services:
+            systemd:
+              crond:
+                enabled: "true"
+                ensureRunning: "true"
+          files:
+            '/opt/actions-runner/Dockerfile':
+              content: |
+                FROM cruizba/ubuntu-dind:latest
+                RUN adduser docker
+                RUN mkdir -p /home/docker/actions-runner && cd /home/docker/actions-runner \
+                  && curl -sL $(curl -s https://api.github.com/repos/actions/runner/releases/latest | grep browser_download_url | cut -d\" -f4 | egrep 'linux-x64-[0-9.]+tar.gz$') | tar zx 
+                RUN chown -R docker /home/docker/actions-runner && /home/docker/actions-runner/bin/installdependencies.sh
+                COPY start.sh runner_hook_job_started.sh /
+                RUN chmod +x /start* && chmod +x /runner_hook*
+                ENTRYPOINT ["/start.sh"]
+            '/opt/actions-runner/start.sh':
+              content: |
+                #!/bin/bash
+                ORGANIZATION=$ORGANIZATION
+                ACCESS_TOKEN=$ACCESS_TOKEN
+                RUNNER_NAME="aws_$(tr -dc A-Za-z0-9 </dev/urandom | head -c 6)"
+                REG_TOKEN=$(curl -sX POST -H "Authorization: token $ACCESS_TOKEN" https://api.github.com/orgs/$ORGANIZATION/actions/runners/registration-token | jq .token --raw-output)
+
+                source /opt/bash-utils/logger.sh
+
+                function wait_for_process () {
+                    local max_time_wait=30
+                    local process_name="$1"
+                    local waited_sec=0
+                    while ! pgrep "$process_name" >/dev/null && ((waited_sec < max_time_wait)); do
+                        INFO "Process $process_name is not running yet. Retrying in 1 seconds"
+                        INFO "Waited $waited_sec seconds of $max_time_wait seconds"
+                        sleep 1
+                        ((waited_sec=waited_sec+1))
+                        if ((waited_sec >= max_time_wait)); then
+                            return 1
+                        fi
+                    done
+                    return 0
+                }
+
+                INFO "Starting supervisor"
+                /usr/bin/supervisord -n >> /dev/null &
+
+                INFO "Waiting for processes to be running"
+                processes=(dockerd)
+
+                for process in "${processes[@]}"; do
+                    wait_for_process "$process"
+                    if [ $? -ne 0 ]; then
+                        ERROR "$process is not running after max time"
+                        exit 1
+                    else
+                        INFO "$process is running"
+                    fi
+                done
+
+                cleanup() {
+                    INFO "Removing runner..."
+                    REMOVE_TOKEN=$(curl -sX POST -H "Authorization: token $ACCESS_TOKEN" https://api.github.com/orgs/$ORGANIZATION/actions/runners/registration-token | jq .token --raw-output)
+                    su docker -c "cd /home/docker/actions-runner && ./config.sh remove --token $REMOVE_TOKEN"
+                    exit 0
+                }
+
+                trap cleanup SIGTERM SIGINT SIGQUIT SIGHUP ERR
+
+                INFO "Configuring runner"
+                su docker -c "cd /home/docker/actions-runner && ./config.sh --url https://github.com/$ORGANIZATION --token $REG_TOKEN --name $RUNNER_NAME --disableupdate"
+
+                INFO "Executing runner"
+                su docker -c "cd /home/docker/actions-runner && ./run.sh" &
+
+                dpid=$!
+                wait $dpid
+              mode: "000755"
+            '/opt/actions-runner/runner_hook_job_started.sh':
+              content: |
+                #!/bin/bash
+                docker run --rm -i \
+                  -v $GITHUB_WORKSPACE:/workspace \
+                  busybox:latest \
+                  /bin/sh -c "rm -rf /workspace/* || true"
+                docker run --rm -i \
+                  -v $GITHUB_WORKSPACE:/workspace \
+                  busybox:latest \
+                  /bin/sh -c "rm -rf /workspace/.??* || true"
+              mode: "000755"
+            '/opt/actions-runner/docker_prune.sh':
+              content: !Sub |
+                #!/bin/bash
+
+                cd /opt/actions-runner
+                docker stop $(docker ps -aq)
+                docker rm -vf $(docker ps -aq)
+                docker volume prune -f
+                docker-compose build --no-cache
+                docker-compose up --scale runner=${RunnersNumber} -d
+              mode: "000755"
+            '/opt/actions-runner/docker-compose.yml':
+              content: !Sub |
+                version: '3'
+                services:
+                  runner:
+                    build: .
+                    privileged: true
+                    network_mode: "host"
+                    environment:
+                      - ORGANIZATION=${GithubOrganization}
+                      - ACCESS_TOKEN=${GithubToken}
+                      - ACTIONS_RUNNER_HOOK_JOB_STARTED=/runner_hook_job_started.sh
+            '/etc/cron.d/docker_prune':
+              content: !Sub |
+                PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+                10 0 * * * root /opt/actions-runner/docker_prune.sh
+              mode: '000644'
+              owner: root
+              group: root
+        github-run:
+          commands:
+            '10-build':
+              command: 'docker-compose build'
+              cwd: '/opt/actions-runner'
+            '20-run':
+              command: !Sub 'docker-compose up --scale runner=${RunnersNumber} -d'
+              cwd: '/opt/actions-runner'
+        system:
+          packages:
+            yum:
+              amazon-cloudwatch-agent: []
+          files:
+            '/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json':
+              content: |
+                {
+                  "metrics": {
+                    "append_dimensions": {
+                      "AutoScalingGroupName": "${!aws:AutoScalingGroupName}",
+                      "ImageId": "${!aws:ImageId}",
+                      "InstanceId": "${!aws:InstanceId}",
+                      "InstanceType": "${!aws:InstanceType}"
+                    },
+                    "metrics_collected": {
+                      "cpu": {
+                        "measurement": [
+                          "cpu_usage_idle",
+                          "cpu_usage_iowait",
+                          "cpu_usage_user",
+                          "cpu_usage_system"
+                        ],
+                        "metrics_collection_interval": 30,
+                        "totalcpu": false
+                      },
+                      "disk": {
+                        "measurement": [
+                          "used_percent",
+                          "inodes_free"
+                        ],
+                        "metrics_collection_interval": 30,
+                        "resources": [
+                          "*"
+                        ]
+                      },
+                      "diskio": {
+                        "measurement": [
+                          "io_time"
+                        ],
+                        "metrics_collection_interval": 30,
+                        "resources": [
+                          "*"
+                        ]
+                      },
+                      "mem": {
+                        "measurement": [
+                          "mem_used_percent"
+                        ],
+                        "metrics_collection_interval": 30
+                      },
+                      "statsd": {
+                        "metrics_aggregation_interval": 30,
+                        "metrics_collection_interval": 10,
+                        "service_address": ":8125"
+                      },
+                      "swap": {
+                        "measurement": [
+                          "swap_used_percent"
+                        ],
+                        "metrics_collection_interval": 30
+                      }
+                    }
+                  },
+                  "logs": {
+                    "logs_collected": {
+                      "files": {
+                        "collect_list": [
+                          {
+                            "log_group_name": "/var/log/boot.log",
+                            "log_stream_name": "{instance_id}",
+                            "file_path": "/var/log/boot.log"
+                          },
+                          {
+                            "log_group_name": "/var/log/messages",
+                            "log_stream_name": "{instance_id}",
+                            "file_path": "/var/log/messages"
+                          },
+                          {
+                            "log_group_name": "/var/log/cloud-init.log",
+                            "log_stream_name": "{instance_id}",
+                            "file_path": "/var/log/cloud-init.log"
+                          },
+                          {
+                            "log_group_name": "/var/log/cloud-init-output.log",
+                            "log_stream_name": "{instance_id}",
+                            "file_path": "/var/log/cloud-init-output.log"
+                          }
+                        ]
+                      }
+                    }
+                  }
+                }
+            '/etc/cfn/cfn-hup.conf':
+              owner: 'root'
+              group: 'root'
+              mode: '000400'
+              content: !Sub |
+                [main]
+                stack=${AWS::StackId}
+                region=${AWS::Region}
+            '/etc/cfn/hooks.d/cfn-auto-reloader.conf':
+              content: !Sub |
+                [cfn-auto-reloader-hook]
+                triggers=post.update
+                path=Resources.Manager.Metadata.AWS::CloudFormation::Init
+                action=/opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --region ${AWS::Region} --resource Manager --configsets default
+                runas=root
+          services:
+            systemd:
+              amazon-cloudwatch-agent:
+                enabled: "true"
+                ensureRunning: "true"
+              cfn-hup:
+                enabled: "true"
+                ensureRunning: "true"
+    Properties:
+      LaunchTemplateData:
+        BlockDeviceMappings:
+        - DeviceName: '/dev/xvda'
+          Ebs:
+            Encrypted: true
+            VolumeSize: !Ref MasterVolumeSize
+            VolumeType: gp3
+        IamInstanceProfile:
+          Name: !Ref RunnerInstanceProfileRole
+        ImageId: !FindInMap ['Manager', !Ref 'AWS::Region', 'AmiId'] 
+        InstanceType: !Ref RunnerInstanceType
+        MetadataOptions:
+             HttpPutResponseHopLimit: 3
+        NetworkInterfaces:
+        - AssociatePublicIpAddress: false
+          DeviceIndex: 0
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash -xe
+            yum update -y aws-cfn-bootstrap
+            /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource LaunchTemplate --region ${AWS::Region} --configsets default
+            /opt/aws/bin/cfn-signal -e $? --stack '${AWS::StackName}' --region '${AWS::Region}' --resource RunnerAutoscalingGroup
+
+  RunnerAutoscalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt 'LaunchTemplate.LatestVersionNumber'
+      MaxSize: !Ref InstancesNumber
+      MinSize: !Ref InstancesNumber
+      Tags:
+      - Key: Name
+        Value: 'Github runner instance'
+        PropagateAtLaunch: true
+      NotificationConfigurations: !If
+      - HasAlertTopic
+      - - NotificationTypes:
+          - 'autoscaling:EC2_INSTANCE_LAUNCH_ERROR'
+          - 'autoscaling:EC2_INSTANCE_TERMINATE_ERROR'
+          TopicARN: {'Fn::ImportValue': !Sub '${ParentAlertStack}-TopicARN'}
+      - []
+      VPCZoneIdentifier:
+      - {'Fn::ImportValue': !Sub '${ParentVPCStack}-SubnetsPrivate'}
+    CreationPolicy:
+      ResourceSignal:
+        Count: 1
+        Timeout: PT1H
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        PauseTime: PT10M
+        SuspendProcesses:
+        - HealthCheck
+        - ReplaceUnhealthy
+        - AZRebalance
+        - AlarmNotification
+        - ScheduledActions
+        WaitOnResourceSignals: true
+
+  Logs:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      RetentionInDays: !Ref LogsRetentionInDays
+
+Outputs:
+  RunnerRole:
+    Description: |
+      Role of GitHub runners.
+    Value: !Ref 'RunnerRole'
+  RunnerRoleARN:
+    Description: |
+      ARN for GitHub runners role.
+    Value: !GetAtt 'RunnerRole.Arn'
